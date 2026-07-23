@@ -52,7 +52,7 @@ button { font: inherit; }
 .privacy-note { margin: 14px 0 0; color: #758596; font-size: 11px; line-height: 1.45; }
 
 .secure-view { position: fixed; z-index: 30; inset: 0; background: white; }
-.secure-toolbar { position: absolute; z-index: 2; top: 10px; right: 14px; display: flex; align-items: center; gap: 9px; padding: 6px 7px 6px 12px; border: 1px solid #d8e0e8; border-radius: 22px; background: #fffffff2; box-shadow: 0 3px 12px #13283a20; font-size: 12px; }
+.secure-toolbar { display: none; }
 .secure-toolbar button { padding: 5px 10px; border: 0; border-radius: 15px; color: white; background: #415a70; cursor: pointer; }
 .secure-view iframe { width: 100%; height: 100%; border: 0; background: white; }
 

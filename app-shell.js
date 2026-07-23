@@ -111,6 +111,39 @@
     }
   }
 
+  function dockSessionToolbar() {
+    const frameDocument = secureFrame.contentDocument;
+    if (!frameDocument) return;
+
+    const navigation = frameDocument.querySelector(".top-nav");
+    if (!navigation || navigation.querySelector(".iaccess-session-nav")) return;
+
+    if (!frameDocument.querySelector('link[data-iaccess-session-style]')) {
+      const stylesheet = frameDocument.createElement("link");
+      stylesheet.rel = "stylesheet";
+      stylesheet.href = appUrl("session-toolbar.css");
+      stylesheet.dataset.iaccessSessionStyle = "";
+      frameDocument.head.append(stylesheet);
+    }
+
+    const sessionNavigation = frameDocument.createElement("div");
+    sessionNavigation.className = "iaccess-session-nav";
+    sessionNavigation.setAttribute("aria-label", "Benutzersitzung");
+
+    const identity = frameDocument.createElement("span");
+    identity.className = "iaccess-session-user";
+    identity.textContent = userLabel.textContent || "Angemeldet";
+
+    const frameLogoutButton = frameDocument.createElement("button");
+    frameLogoutButton.className = "iaccess-session-logout";
+    frameLogoutButton.type = "button";
+    frameLogoutButton.textContent = "Abmelden";
+    frameLogoutButton.addEventListener("click", logout);
+
+    sessionNavigation.append(identity, frameLogoutButton);
+    navigation.append(sessionNavigation);
+  }
+
   async function fetchContentKey(token) {
     const response = await fetch(config.keyEndpoint, {
       headers: { authorization: `Bearer ${token}`, accept: "application/json" },
@@ -207,6 +240,7 @@
     setStatus(error.message, true);
   }));
   logoutButton.addEventListener("click", logout);
+  secureFrame.addEventListener("load", dockSessionToolbar);
   window.addEventListener("pagehide", () => {
     accessToken = null;
     navigator.serviceWorker.controller?.postMessage({ type: "CLEAR_CONTENT_KEY" });
