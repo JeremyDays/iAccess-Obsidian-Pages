@@ -4,9 +4,14 @@ const FORMAT_VERSION = 2;
 const SCOPE_PATH = new URL(self.registration.scope).pathname.replace(/\/$/, "");
 const SECURE_PREFIX = `${SCOPE_PATH}/secure-app/`;
 const encoder = new TextEncoder();
+const MAX_SESSION_MS = 24 * 60 * 60 * 1000;
 let contentKey = null;
 let keyVersion = null;
+let keyExpiresAt = 0;
 let manifestPromise = null;
+let recoveryPromise = null;
+let recoveryRequestId = 0;
+let recoveryResolver = null;
 
 function appUrl(relative) {
   return `${SCOPE_PATH}/${relative}`;
@@ -19,29 +24,90 @@ self.addEventListener("message", (event) => {
   const data = event.data || {};
   if (data.type === "CLAIM_CLIENTS") event.waitUntil(self.clients.claim());
   if (data.type === "CLEAR_CONTENT_KEY") {
-    contentKey = null;
-    keyVersion = null;
-    manifestPromise = null;
+    clearContentKey();
+    finishRecovery(data.requestId, false);
+  }
+  if (data.type === "CONTENT_KEY_UNAVAILABLE") {
+    finishRecovery(data.requestId, false);
   }
   if (data.type === "SET_CONTENT_KEY") {
     event.waitUntil((async () => {
       try {
         const raw = fromBase64(data.keyBase64);
         if (raw.byteLength !== 32) throw new Error("Ungueltiger Inhaltsschluessel");
+        if (
+          !Number.isFinite(data.expiresAt)
+          || data.expiresAt <= Date.now()
+          || data.expiresAt > Date.now() + MAX_SESSION_MS + 60_000
+        ) throw new Error("Ungueltige Tagessitzung");
         contentKey = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
         keyVersion = data.keyVersion;
+        keyExpiresAt = data.expiresAt;
         manifestPromise = null;
+        finishRecovery(data.requestId, true);
         event.ports[0]?.postMessage({ ok: true });
       } catch (error) {
-        contentKey = null;
-        keyVersion = null;
-        manifestPromise = null;
+        clearContentKey();
+        finishRecovery(data.requestId, false);
         event.ports[0]?.postMessage({ ok: false });
         throw error;
       }
     })());
   }
 });
+
+function clearContentKey() {
+  contentKey = null;
+  keyVersion = null;
+  keyExpiresAt = 0;
+  manifestPromise = null;
+}
+
+function contentKeyIsValid() {
+  return Boolean(contentKey && keyVersion && keyExpiresAt > Date.now());
+}
+
+function finishRecovery(requestId, recovered) {
+  if (!recoveryResolver || requestId !== recoveryRequestId) return;
+  recoveryResolver(recovered);
+}
+
+async function recoverContentKey() {
+  if (contentKeyIsValid()) return true;
+  clearContentKey();
+  if (recoveryPromise) return await recoveryPromise;
+
+  const requestId = ++recoveryRequestId;
+  recoveryPromise = (async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    if (!windows.length) return false;
+    return await new Promise((resolve) => {
+      let finished = false;
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        recoveryResolver = null;
+        resolve(result);
+      };
+      recoveryResolver = finish;
+      const timeout = setTimeout(() => finish(false), 5000);
+      for (const client of windows) client.postMessage({ type: "CONTENT_KEY_REQUIRED", requestId });
+    });
+  })();
+
+  try {
+    return Boolean(await recoveryPromise) && contentKeyIsValid();
+  } finally {
+    recoveryPromise = null;
+    recoveryResolver = null;
+  }
+}
+
+async function notifySessionExpired() {
+  const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  for (const client of windows) client.postMessage({ type: "SESSION_EXPIRED" });
+}
 
 function fromBase64(value) {
   const binary = atob(value);
@@ -61,7 +127,7 @@ async function decryptPayload(payload, logicalPath) {
 }
 
 async function loadManifest() {
-  if (!contentKey || !keyVersion) throw new Error("Nicht angemeldet");
+  if (!contentKeyIsValid()) throw new Error("Nicht angemeldet");
   if (!manifestPromise) {
     manifestPromise = (async () => {
       const buildResponse = await fetch(appUrl("secure/build.json"), { cache: "no-store" });
@@ -102,7 +168,10 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin || !url.pathname.startsWith(SECURE_PREFIX)) return;
   event.respondWith((async () => {
-    if (!contentKey) return new Response("Anmeldung erforderlich", { status: 401, headers: responseHeaders("text/plain; charset=utf-8") });
+    if (!await recoverContentKey()) {
+      await notifySessionExpired();
+      return new Response("Anmeldung erforderlich", { status: 401, headers: responseHeaders("text/plain; charset=utf-8") });
+    }
     const requested = logicalPath(url);
     if (!requested) return new Response("Nicht gefunden", { status: 404 });
     try {

@@ -9,9 +9,19 @@
   const secureView = document.querySelector("#secure-view");
   const secureFrame = document.querySelector("#secure-frame");
   const userLabel = document.querySelector("#user-label");
+  const lockLayer = document.querySelector(".lock-layer");
+  const publicPreview = document.querySelector("#public-preview");
   const encoder = new TextEncoder();
 
-  let accessToken = null;
+  const DAILY_SESSION_MS = 24 * 60 * 60 * 1000;
+  const DAILY_SESSION_STORAGE_KEY = "iaccess.daily-session.v1";
+  const SESSION_DATABASE = "iaccess-secure-session";
+  const SESSION_STORE = "keys";
+  const SESSION_WRAP_KEY_ID = "daily-session";
+  const SESSION_AAD = encoder.encode("iaccess-odo-daily-session:v1");
+
+  let activeKeyData = null;
+  let activeSessionExpiresAt = 0;
 
   function appUrl(relative = "") {
     const base = config.basePath || "";
@@ -36,6 +46,17 @@
     let binary = "";
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+  }
+
+  function bytesToBase64(bytes) {
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
+  function bytesFromBase64(value) {
+    const binary = atob(value);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
   }
 
   async function sha256Base64Url(value) {
@@ -101,14 +122,115 @@
     return { ...tokens, returnPath: saved.returnPath || config.defaultDocument };
   }
 
-  function displayIdentity(idToken) {
+  function identityFromIdToken(idToken) {
     try {
       const part = idToken.split(".")[1].replaceAll("-", "+").replaceAll("_", "/");
       const payload = JSON.parse(decodeURIComponent(Array.from(atob(part), (char) => `%${char.charCodeAt(0).toString(16).padStart(2, "0")}`).join("")));
-      userLabel.textContent = payload.email || payload.name || "Angemeldet";
+      return payload.email || payload.name || "Angemeldet";
     } catch {
-      userLabel.textContent = "Angemeldet";
+      return "Angemeldet";
     }
+  }
+
+  function openSessionDatabase() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(SESSION_DATABASE, 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(SESSION_STORE)) request.result.createObjectStore(SESSION_STORE);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("Der geschützte Sitzungsspeicher konnte nicht geöffnet werden."));
+    });
+  }
+
+  async function sessionStoreRequest(mode, action) {
+    const database = await openSessionDatabase();
+    try {
+      return await new Promise((resolve, reject) => {
+        const transaction = database.transaction(SESSION_STORE, mode);
+        const request = action(transaction.objectStore(SESSION_STORE));
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Der geschützte Sitzungsspeicher konnte nicht gelesen werden."));
+      });
+    } finally {
+      database.close();
+    }
+  }
+
+  async function wrappingKey(create = false) {
+    let key = await sessionStoreRequest("readonly", (store) => store.get(SESSION_WRAP_KEY_ID));
+    if (!key && create) {
+      key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+      await sessionStoreRequest("readwrite", (store) => store.put(key, SESSION_WRAP_KEY_ID));
+    }
+    return key || null;
+  }
+
+  async function clearDailySession() {
+    try {
+      localStorage.removeItem(DAILY_SESSION_STORAGE_KEY);
+    } catch {
+      // Browser may disable persistent storage in a private context.
+    }
+    try {
+      await sessionStoreRequest("readwrite", (store) => store.delete(SESSION_WRAP_KEY_ID));
+    } catch {
+      // A failed cleanup must not prevent an explicit logout.
+    }
+  }
+
+  async function saveDailySession(keyData, identity, expiresAt) {
+    const key = await wrappingKey(true);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const plain = encoder.encode(JSON.stringify({
+      keyBase64: keyData.keyBase64,
+      keyVersion: keyData.keyVersion,
+      identity,
+      expiresAt
+    }));
+    const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: SESSION_AAD }, key, plain);
+    localStorage.setItem(DAILY_SESSION_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      expiresAt,
+      iv: bytesToBase64(iv),
+      ciphertext: bytesToBase64(new Uint8Array(encrypted))
+    }));
+  }
+
+  async function restoreDailySession() {
+    try {
+      const stored = localStorage.getItem(DAILY_SESSION_STORAGE_KEY);
+      if (!stored) return null;
+      const record = JSON.parse(stored);
+      if (record.version !== 1 || !Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now()) throw new Error("Tagessitzung abgelaufen");
+      const key = await wrappingKey(false);
+      if (!key) throw new Error("Sitzungsschlüssel fehlt");
+      const plain = await crypto.subtle.decrypt({
+        name: "AES-GCM",
+        iv: bytesFromBase64(record.iv),
+        additionalData: SESSION_AAD
+      }, key, bytesFromBase64(record.ciphertext));
+      const session = JSON.parse(new TextDecoder().decode(plain));
+      const rawKey = bytesFromBase64(session.keyBase64);
+      if (
+        rawKey.byteLength !== 32
+        || typeof session.keyVersion !== "string"
+        || !session.keyVersion
+        || session.expiresAt !== record.expiresAt
+      ) throw new Error("Tagessitzung ist ungültig");
+      return {
+        keyData: { keyBase64: session.keyBase64, keyVersion: session.keyVersion },
+        identity: session.identity || "Angemeldet",
+        expiresAt: session.expiresAt
+      };
+    } catch {
+      await clearDailySession();
+      return null;
+    }
+  }
+
+  function activeSessionIsValid() {
+    return Boolean(activeKeyData && activeSessionExpiresAt > Date.now());
   }
 
   function dockSessionToolbar() {
@@ -138,7 +260,7 @@
     frameLogoutButton.className = "iaccess-session-logout";
     frameLogoutButton.type = "button";
     frameLogoutButton.textContent = "Abmelden";
-    frameLogoutButton.addEventListener("click", logout);
+    frameLogoutButton.addEventListener("click", () => logout().catch((error) => setStatus(error.message, true)));
 
     sessionNavigation.append(identity, frameLogoutButton);
     navigation.append(sessionNavigation);
@@ -171,13 +293,8 @@
     });
   }
 
-  async function openSecureSite(tokens, returnPath) {
-    setStatus("Zugriff wird geprüft und Inhalt entschlüsselt …");
-    const [keyData, controller] = await Promise.all([
-      fetchContentKey(tokens.access_token),
-      serviceWorkerController()
-    ]);
-    await new Promise((resolve, reject) => {
+  async function provideKeyToWorker(controller, keyData, expiresAt, requestId = null) {
+    return await new Promise((resolve, reject) => {
       const channel = new MessageChannel();
       const timeout = setTimeout(() => reject(new Error("Der Entschlüsselungsschlüssel konnte nicht sicher übergeben werden.")), 8000);
       channel.port1.onmessage = (event) => {
@@ -188,22 +305,58 @@
       controller.postMessage({
         type: "SET_CONTENT_KEY",
         keyBase64: keyData.keyBase64,
-        keyVersion: keyData.keyVersion
+        keyVersion: keyData.keyVersion,
+        expiresAt,
+        requestId
       }, [channel.port2]);
     });
-    displayIdentity(tokens.id_token || "");
+  }
+
+  async function openSecureSite(session, returnPath) {
+    setStatus("Zugriff wird geprüft und Inhalt entschlüsselt …");
+    activeKeyData = session.keyData;
+    activeSessionExpiresAt = session.expiresAt;
+    userLabel.textContent = session.identity || "Angemeldet";
+    const controller = await serviceWorkerController();
+    await provideKeyToWorker(controller, session.keyData, session.expiresAt);
     secureFrame.src = appUrl(`secure-app/${returnPath}`);
     secureFrame.addEventListener("load", () => {
       loginDialog.hidden = true;
-      document.querySelector(".lock-layer").hidden = true;
-      document.querySelector("#public-preview").hidden = true;
+      lockLayer.hidden = true;
+      publicPreview.hidden = true;
       secureView.hidden = false;
     }, { once: true });
   }
 
-  function logout() {
-    accessToken = null;
+  async function expireSession(message = "Ihre Tagessitzung ist abgelaufen. Bitte melden Sie sich erneut an.") {
+    activeKeyData = null;
+    activeSessionExpiresAt = 0;
     navigator.serviceWorker.controller?.postMessage({ type: "CLEAR_CONTENT_KEY" });
+    await clearDailySession();
+    secureFrame.src = "about:blank";
+    secureView.hidden = true;
+    publicPreview.hidden = false;
+    lockLayer.hidden = false;
+    loginDialog.hidden = false;
+    loginButton.disabled = false;
+    setStatus(message, true);
+  }
+
+  async function handleServiceWorkerMessage(event) {
+    const data = event.data || {};
+    if (data.type === "CONTENT_KEY_REQUIRED") {
+      if (activeSessionIsValid()) {
+        await provideKeyToWorker(event.source, activeKeyData, activeSessionExpiresAt, data.requestId);
+      } else {
+        event.source?.postMessage({ type: "CONTENT_KEY_UNAVAILABLE", requestId: data.requestId });
+        await expireSession();
+      }
+    }
+    if (data.type === "SESSION_EXPIRED") await expireSession();
+  }
+
+  async function logout() {
+    await expireSession("Sie wurden abgemeldet.");
     const parameters = new URLSearchParams({ client_id: config.auth0ClientId, returnTo: callbackUrl() });
     location.assign(`${authBase()}/v2/logout?${parameters}`);
   }
@@ -224,27 +377,39 @@
       setStatus("Dieser Browser unterstützt die erforderliche sichere Entschlüsselung nicht.", true);
       return;
     }
+    navigator.serviceWorker.addEventListener("message", (event) => {
+      handleServiceWorkerMessage(event).catch(() => expireSession());
+    });
     const parameters = new URLSearchParams(location.search);
     if (parameters.has("error")) throw new Error(parameters.get("error_description") || "Die Anmeldung wurde abgebrochen.");
     if (parameters.has("code")) {
       setStatus("Anmeldung wird abgeschlossen …");
       const tokens = await exchangeCode(parameters.get("code"), parameters.get("state"));
-      accessToken = tokens.access_token;
+      const keyData = await fetchContentKey(tokens.access_token);
+      const session = {
+        keyData,
+        identity: identityFromIdToken(tokens.id_token || ""),
+        expiresAt: Date.now() + DAILY_SESSION_MS
+      };
+      try {
+        await saveDailySession(session.keyData, session.identity, session.expiresAt);
+      } catch {
+        // The active in-memory session remains usable even if this browser blocks persistent storage.
+      }
       history.replaceState({}, "", appUrl());
-      await openSecureSite(tokens, tokens.returnPath);
+      await openSecureSite(session, tokens.returnPath);
+      return;
     }
+    const restored = await restoreDailySession();
+    if (restored) await openSecureSite(restored, requestedDocument());
   }
 
   loginButton.addEventListener("click", () => startLogin().catch((error) => {
     loginButton.disabled = false;
     setStatus(error.message, true);
   }));
-  logoutButton.addEventListener("click", logout);
+  logoutButton.addEventListener("click", () => logout().catch((error) => setStatus(error.message, true)));
   secureFrame.addEventListener("load", dockSessionToolbar);
-  window.addEventListener("pagehide", () => {
-    accessToken = null;
-    navigator.serviceWorker.controller?.postMessage({ type: "CLEAR_CONTENT_KEY" });
-  });
   initialize().catch((error) => {
     loginButton.disabled = false;
     history.replaceState({}, "", appUrl());
