@@ -18,6 +18,7 @@
   const SESSION_DATABASE = "iaccess-secure-session";
   const SESSION_STORE = "keys";
   const SESSION_WRAP_KEY_ID = "daily-session";
+  const SESSION_RECORD_ID = "daily-session-record";
   const SESSION_AAD = encoder.encode("iaccess-odo-daily-session:v1");
 
   let activeKeyData = null;
@@ -173,6 +174,7 @@
       // Browser may disable persistent storage in a private context.
     }
     try {
+      await sessionStoreRequest("readwrite", (store) => store.delete(SESSION_RECORD_ID));
       await sessionStoreRequest("readwrite", (store) => store.delete(SESSION_WRAP_KEY_ID));
     } catch {
       // A failed cleanup must not prevent an explicit logout.
@@ -189,19 +191,27 @@
       expiresAt
     }));
     const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: SESSION_AAD }, key, plain);
-    localStorage.setItem(DAILY_SESSION_STORAGE_KEY, JSON.stringify({
+    const record = {
       version: 1,
       expiresAt,
       iv: bytesToBase64(iv),
       ciphertext: bytesToBase64(new Uint8Array(encrypted))
-    }));
+    };
+    await sessionStoreRequest("readwrite", (store) => store.put(record, SESSION_RECORD_ID));
+    // Remove records created by the previous implementation after a successful migration.
+    localStorage.removeItem(DAILY_SESSION_STORAGE_KEY);
   }
 
   async function restoreDailySession() {
     try {
-      const stored = localStorage.getItem(DAILY_SESSION_STORAGE_KEY);
-      if (!stored) return null;
-      const record = JSON.parse(stored);
+      let record = await sessionStoreRequest("readonly", (store) => store.get(SESSION_RECORD_ID));
+      let migrateLegacyRecord = false;
+      if (!record) {
+        const stored = localStorage.getItem(DAILY_SESSION_STORAGE_KEY);
+        if (!stored) return null;
+        record = JSON.parse(stored);
+        migrateLegacyRecord = true;
+      }
       if (record.version !== 1 || !Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now()) throw new Error("Tagessitzung abgelaufen");
       const key = await wrappingKey(false);
       if (!key) throw new Error("Sitzungsschlüssel fehlt");
@@ -218,11 +228,16 @@
         || !session.keyVersion
         || session.expiresAt !== record.expiresAt
       ) throw new Error("Tagessitzung ist ungültig");
-      return {
+      const restored = {
         keyData: { keyBase64: session.keyBase64, keyVersion: session.keyVersion },
         identity: session.identity || "Angemeldet",
         expiresAt: session.expiresAt
       };
+      if (migrateLegacyRecord) {
+        await sessionStoreRequest("readwrite", (store) => store.put(record, SESSION_RECORD_ID));
+        localStorage.removeItem(DAILY_SESSION_STORAGE_KEY);
+      }
+      return restored;
     } catch {
       await clearDailySession();
       return null;
@@ -280,7 +295,10 @@
   }
 
   async function serviceWorkerController() {
-    const registration = await navigator.serviceWorker.register(appUrl("service-worker.js"), { scope: appUrl() });
+    const registration = await navigator.serviceWorker.register(appUrl("service-worker.js?v=20260909-1"), {
+      scope: appUrl(),
+      updateViaCache: "none"
+    });
     await navigator.serviceWorker.ready;
     if (navigator.serviceWorker.controller) return navigator.serviceWorker.controller;
     return await new Promise((resolve, reject) => {

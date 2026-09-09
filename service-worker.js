@@ -5,6 +5,11 @@ const SCOPE_PATH = new URL(self.registration.scope).pathname.replace(/\/$/, "");
 const SECURE_PREFIX = `${SCOPE_PATH}/secure-app/`;
 const encoder = new TextEncoder();
 const MAX_SESSION_MS = 24 * 60 * 60 * 1000;
+const SESSION_DATABASE = "iaccess-secure-session";
+const SESSION_STORE = "keys";
+const SESSION_WRAP_KEY_ID = "daily-session";
+const SESSION_RECORD_ID = "daily-session-record";
+const SESSION_AAD = encoder.encode("iaccess-odo-daily-session:v1");
 let contentKey = null;
 let keyVersion = null;
 let keyExpiresAt = 0;
@@ -26,6 +31,7 @@ self.addEventListener("message", (event) => {
   if (data.type === "CLEAR_CONTENT_KEY") {
     clearContentKey();
     finishRecovery(data.requestId, false);
+    event.waitUntil(clearPersistedSession());
   }
   if (data.type === "CONTENT_KEY_UNAVAILABLE") {
     finishRecovery(data.requestId, false);
@@ -67,6 +73,79 @@ function contentKeyIsValid() {
   return Boolean(contentKey && keyVersion && keyExpiresAt > Date.now());
 }
 
+function openSessionDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(SESSION_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(SESSION_STORE)) request.result.createObjectStore(SESSION_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Sitzungsspeicher nicht erreichbar"));
+  });
+}
+
+async function sessionStoreRequest(mode, action) {
+  const database = await openSessionDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(SESSION_STORE, mode);
+      const request = action(transaction.objectStore(SESSION_STORE));
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("Sitzungsspeicher konnte nicht gelesen werden"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function clearPersistedSession() {
+  try {
+    await sessionStoreRequest("readwrite", (store) => store.delete(SESSION_RECORD_ID));
+    await sessionStoreRequest("readwrite", (store) => store.delete(SESSION_WRAP_KEY_ID));
+  } catch {
+    // The page performs the same cleanup; the worker must still clear its memory if storage is unavailable.
+  }
+}
+
+async function restorePersistedContentKey() {
+  try {
+    const [record, wrappingKey] = await Promise.all([
+      sessionStoreRequest("readonly", (store) => store.get(SESSION_RECORD_ID)),
+      sessionStoreRequest("readonly", (store) => store.get(SESSION_WRAP_KEY_ID))
+    ]);
+    if (
+      !record
+      || !wrappingKey
+      || record.version !== 1
+      || !Number.isFinite(record.expiresAt)
+      || record.expiresAt <= Date.now()
+      || record.expiresAt > Date.now() + MAX_SESSION_MS + 60_000
+    ) return false;
+
+    const plain = await crypto.subtle.decrypt({
+      name: "AES-GCM",
+      iv: fromBase64(record.iv),
+      additionalData: SESSION_AAD
+    }, wrappingKey, fromBase64(record.ciphertext));
+    const session = JSON.parse(new TextDecoder().decode(plain));
+    const raw = fromBase64(session.keyBase64);
+    if (
+      raw.byteLength !== 32
+      || typeof session.keyVersion !== "string"
+      || !session.keyVersion
+      || session.expiresAt !== record.expiresAt
+    ) return false;
+
+    contentKey = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+    keyVersion = session.keyVersion;
+    keyExpiresAt = session.expiresAt;
+    manifestPromise = null;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function finishRecovery(requestId, recovered) {
   if (!recoveryResolver || requestId !== recoveryRequestId) return;
   recoveryResolver(recovered);
@@ -79,6 +158,7 @@ async function recoverContentKey() {
 
   const requestId = ++recoveryRequestId;
   recoveryPromise = (async () => {
+    if (await restorePersistedContentKey()) return true;
     const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     if (!windows.length) return false;
     return await new Promise((resolve) => {
