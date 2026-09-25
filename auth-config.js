@@ -5,5 +5,5 @@ globalThis.IACCESS_AUTH_CONFIG = Object.freeze({
   "keyEndpoint": "https://iaccess-obsidian-key.netlify.app/.netlify/functions/site-key",
   "siteOrigin": "https://obsidian.iaccess.de",
   "basePath": "",
-  "defaultDocument": "notes/projektkarten.html"
+  "defaultDocument": "notes/dashboard-iaccess.html"
 });
