@@ -23,6 +23,8 @@
 
   let activeKeyData = null;
   let activeSessionExpiresAt = 0;
+  let activeAccessToken = null;
+  let activeAccessTokenExpiresAt = 0;
 
   function appUrl(relative = "") {
     const base = config.basePath || "";
@@ -181,14 +183,16 @@
     }
   }
 
-  async function saveDailySession(keyData, identity, expiresAt) {
+  async function saveDailySession(keyData, identity, expiresAt, accessToken = null, accessTokenExpiresAt = 0) {
     const key = await wrappingKey(true);
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const plain = encoder.encode(JSON.stringify({
       keyBase64: keyData.keyBase64,
       keyVersion: keyData.keyVersion,
       identity,
-      expiresAt
+      expiresAt,
+      accessToken,
+      accessTokenExpiresAt
     }));
     const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: SESSION_AAD }, key, plain);
     const record = {
@@ -231,7 +235,9 @@
       const restored = {
         keyData: { keyBase64: session.keyBase64, keyVersion: session.keyVersion },
         identity: session.identity || "Angemeldet",
-        expiresAt: session.expiresAt
+        expiresAt: session.expiresAt,
+        accessToken: typeof session.accessToken === "string" ? session.accessToken : null,
+        accessTokenExpiresAt: Number.isFinite(session.accessTokenExpiresAt) ? session.accessTokenExpiresAt : 0
       };
       if (migrateLegacyRecord) {
         await sessionStoreRequest("readwrite", (store) => store.put(record, SESSION_RECORD_ID));
@@ -334,6 +340,8 @@
     setStatus("Zugriff wird geprüft und Inhalt entschlüsselt …");
     activeKeyData = session.keyData;
     activeSessionExpiresAt = session.expiresAt;
+    activeAccessToken = session.accessToken || null;
+    activeAccessTokenExpiresAt = session.accessTokenExpiresAt || 0;
     userLabel.textContent = session.identity || "Angemeldet";
     const controller = await serviceWorkerController();
     await provideKeyToWorker(controller, session.keyData, session.expiresAt);
@@ -349,6 +357,8 @@
   async function expireSession(message = "Ihre Tagessitzung ist abgelaufen. Bitte melden Sie sich erneut an.") {
     activeKeyData = null;
     activeSessionExpiresAt = 0;
+    activeAccessToken = null;
+    activeAccessTokenExpiresAt = 0;
     navigator.serviceWorker.controller?.postMessage({ type: "CLEAR_CONTENT_KEY" });
     await clearDailySession();
     secureFrame.src = "about:blank";
@@ -371,6 +381,36 @@
       }
     }
     if (data.type === "SESSION_EXPIRED") await expireSession();
+  }
+
+  async function handleDashboardDDRequest(event) {
+    const data = event.data || {};
+    if (data.type !== "DD_STATE_REQUEST" || event.origin !== location.origin) return;
+    const dashboardFrame = secureFrame.contentDocument?.querySelector("#dd-dashboard-frame")?.contentWindow;
+    if (!dashboardFrame || event.source !== dashboardFrame) return;
+    const requestId = data.requestId;
+    if (typeof requestId !== "string" || requestId.length > 100 || !["GET", "POST"].includes(data.method)) return;
+    const reply = (status, body) => dashboardFrame.postMessage({ type: "DD_STATE_RESPONSE", requestId, status, body }, event.origin);
+    if (!activeAccessToken || activeAccessTokenExpiresAt <= Date.now()) {
+      reply(401, { error: "Bitte für die gemeinsame Bearbeitung abmelden und erneut anmelden." });
+      return;
+    }
+    try {
+      const response = await fetch(new URL("dd-state", config.keyEndpoint), {
+        method: data.method,
+        headers: {
+          authorization: `Bearer ${activeAccessToken}`,
+          accept: "application/json",
+          ...(data.method === "POST" ? { "content-type": "application/json" } : {})
+        },
+        body: data.method === "POST" ? JSON.stringify(data.body) : undefined,
+        cache: "no-store",
+        credentials: "omit"
+      });
+      reply(response.status, await response.json());
+    } catch {
+      reply(503, { error: "Der gemeinsame Speicher ist nicht erreichbar." });
+    }
   }
 
   async function logout() {
@@ -407,10 +447,12 @@
       const session = {
         keyData,
         identity: identityFromIdToken(tokens.id_token || ""),
-        expiresAt: Date.now() + DAILY_SESSION_MS
+        expiresAt: Date.now() + DAILY_SESSION_MS,
+        accessToken: tokens.access_token,
+        accessTokenExpiresAt: Date.now() + Math.max(0, Number(tokens.expires_in || 0) - 30) * 1000
       };
       try {
-        await saveDailySession(session.keyData, session.identity, session.expiresAt);
+        await saveDailySession(session.keyData, session.identity, session.expiresAt, session.accessToken, session.accessTokenExpiresAt);
       } catch {
         // The active in-memory session remains usable even if this browser blocks persistent storage.
       }
@@ -428,6 +470,9 @@
   }));
   logoutButton.addEventListener("click", () => logout().catch((error) => setStatus(error.message, true)));
   secureFrame.addEventListener("load", dockSessionToolbar);
+  window.addEventListener("message", (event) => {
+    handleDashboardDDRequest(event).catch(() => {});
+  });
   initialize().catch((error) => {
     loginButton.disabled = false;
     history.replaceState({}, "", appUrl());
