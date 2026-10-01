@@ -255,6 +255,9 @@ self.addEventListener("fetch", (event) => {
     const requested = logicalPath(url);
     if (!requested) return new Response("Nicht gefunden", { status: 404 });
     try {
+      // A new page navigation must read the current encrypted manifest. Otherwise
+      // a long-lived browser session can keep serving an older ODO publication.
+      if (requested.endsWith(".html")) manifestPromise = null;
       const manifest = await loadManifest();
       const record = manifest.files[requested];
       if (!record || !/^[a-f0-9]{64}\.bin$/.test(record.blob)) return new Response("Nicht gefunden", { status: 404 });

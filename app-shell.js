@@ -301,7 +301,7 @@
   }
 
   async function serviceWorkerController() {
-    const registration = await navigator.serviceWorker.register(appUrl("service-worker.js?v=20260909-1"), {
+    const registration = await navigator.serviceWorker.register(appUrl("service-worker.js?v=20261001-1"), {
       scope: appUrl(),
       updateViaCache: "none"
     });
